@@ -1,0 +1,24 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="orangeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FF8E64" />
+      <stop offset="100%" style="stop-color:#E65C34" />
+    </linearGradient>
+  </defs>
+  <rect x="5" y="5" width="90" height="90" rx="24" fill="url(#orangeGrad)" />
+  <g transform="translate(50,50)" fill="#FFFFFF">
+    <circle cx="0" cy="0" r="4" />
+    <rect x="-3" y="-38" width="6" height="40" rx="3" transform="rotate(5)" />
+    <rect x="-2.5" y="-42" width="5" height="44" rx="2.5" transform="rotate(35)" />
+    <rect x="-3" y="-34" width="6" height="36" rx="3" transform="rotate(65)" />
+    <rect x="-3.5" y="-38" width="7" height="40" rx="3.5" transform="rotate(95)" />
+    <rect x="-3" y="-32" width="6" height="34" rx="3" transform="rotate(125)" />
+    <rect x="-3.5" y="-30" width="7" height="32" rx="3.5" transform="rotate(150)" />
+    <rect x="-4" y="-34" width="8" height="36" rx="4" transform="rotate(175)" />
+    <rect x="-2.25" y="-32" width="4.5" height="34" rx="2.25" transform="rotate(205)" />
+    <rect x="-2.5" y="-33" width="5" height="35" rx="2.5" transform="rotate(235)" />
+    <rect x="-4.5" y="-34" width="9" height="36" rx="4.5" transform="rotate(265)" />
+    <rect x="-3.5" y="-38" width="7" height="40" rx="3.5" transform="rotate(300)" />
+    <rect x="-3" y="-40" width="6" height="42" rx="3" transform="rotate(335)" />
+  </g>
+</svg>

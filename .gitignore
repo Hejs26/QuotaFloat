@@ -1,0 +1,9 @@
+.DS_Store
+.claude/
+.build/
+.swiftpm/
+dist/
+*.app
+*.zip
+*.b64
+Resources/AppIcon.iconset/
