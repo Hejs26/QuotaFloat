@@ -11,7 +11,12 @@ struct FloatingQuotaView: View {
   @ObservedObject var displayPreferences: DisplayPreferences
   @ObservedObject var contentPreferences: ContentPreferences
   @ObservedObject var credentialPreferences: ProviderCredentialPreferences
+  @ObservedObject var attachmentState: WindowAttachmentState
+  let onToggleWindowAttachment: () -> Void
   @State private var isHovering = false
+  @State private var isHoveringAttachmentControl = false
+  @State private var isShowingAttachmentFeedback = false
+  @State private var attachmentFeedbackID = UUID()
   @State private var isShowingManualRefreshFeedback = false
 
   var body: some View {
@@ -39,6 +44,10 @@ struct FloatingQuotaView: View {
         self.collapsedBrand
       } else {
         self.providerContent
+
+        self.attachmentControl
+          .frame(width: PanelMargins.right)
+          .frame(maxWidth: .infinity, alignment: .trailing)
 
         self.controls
           .frame(width: 32)
@@ -320,6 +329,48 @@ struct FloatingQuotaView: View {
       .help("立即刷新")
     }
     .buttonStyle(StripButtonStyle())
+  }
+
+  private var attachmentControl: some View {
+    let isAvailable = self.attachmentState.canAttachToFrontmostWindow
+      || self.attachmentState.isAttached
+    return ZStack {
+      if isAvailable {
+        Button {
+          self.onToggleWindowAttachment()
+          self.showAttachmentFeedback()
+        } label: {
+          PinOutlineIcon()
+            .frame(width: 12, height: 12)
+        }
+        .buttonStyle(AttachmentButtonStyle(isAttached: self.attachmentState.isAttached))
+        .opacity(
+          self.isHoveringAttachmentControl || self.isShowingAttachmentFeedback ? 1 : 0)
+        .help(self.attachmentState.isAttached ? "解除位置绑定" : "绑定到当前应用窗口")
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .contentShape(Rectangle())
+    .onHover { hovering in
+      self.isHoveringAttachmentControl = hovering
+    }
+    .animation(.easeOut(duration: 0.12), value: self.isHoveringAttachmentControl)
+    .animation(.easeOut(duration: 0.12), value: self.isShowingAttachmentFeedback)
+    .animation(.easeOut(duration: 0.12), value: self.attachmentState.isAttached)
+  }
+
+  private func showAttachmentFeedback() {
+    self.isShowingAttachmentFeedback = true
+    let feedbackID = UUID()
+    self.attachmentFeedbackID = feedbackID
+    Task {
+      try? await Task.sleep(for: .seconds(3))
+      await MainActor.run {
+        if self.attachmentFeedbackID == feedbackID {
+          self.isShowingAttachmentFeedback = false
+        }
+      }
+    }
   }
 }
 
@@ -852,6 +903,38 @@ private struct StripButtonStyle: ButtonStyle {
       .background(Color.black.opacity(configuration.isPressed ? 0.09 : 0.035), in: Circle())
       .frame(width: 15.5, height: 20)
       .contentShape(Rectangle())
+  }
+}
+
+private struct AttachmentButtonStyle: ButtonStyle {
+  let isAttached: Bool
+
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .foregroundStyle(
+        self.isAttached
+          ? Color(red: 0.33, green: 0.30, blue: 0.26)
+          : Color.black.opacity(0.48))
+      .frame(width: 22, height: 22)
+      .background(
+        self.backgroundColor(isPressed: configuration.isPressed),
+        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+      .overlay {
+        RoundedRectangle(cornerRadius: 7, style: .continuous)
+          .stroke(
+            self.isAttached
+              ? Color.black.opacity(0.16)
+              : Color.black.opacity(0.08),
+            lineWidth: 0.8)
+      }
+      .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+  }
+
+  private func backgroundColor(isPressed: Bool) -> Color {
+    if self.isAttached {
+      return Color.black.opacity(isPressed ? 0.12 : 0.08)
+    }
+    return Color.white.opacity(isPressed ? 0.98 : 0.86)
   }
 }
 

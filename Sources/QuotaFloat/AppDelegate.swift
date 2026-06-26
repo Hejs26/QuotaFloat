@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import CodexBarCore
 import Combine
 import CoreGraphics
@@ -176,6 +177,12 @@ final class ContentPreferences: ObservableObject {
 }
 
 @MainActor
+final class WindowAttachmentState: ObservableObject {
+  @Published fileprivate(set) var isAttached = false
+  @Published fileprivate(set) var canAttachToFrontmostWindow = false
+}
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   private static let supportedBundleIdentifiers = [
     "com.openai.codex",
@@ -190,14 +197,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       kimiAPIKeyStore: self.credentialPreferences.kimiAPIKeyStore))
   private let displayPreferences = DisplayPreferences()
   private let contentPreferences = ContentPreferences()
+  private let attachmentState = WindowAttachmentState()
   private var panel: NSPanel?
   private var displayModeObserver: AnyCancellable?
   private var contentModeObserver: AnyCancellable?
   private var workspaceObserver: NSObjectProtocol?
   private var visibilityTimer: Timer?
+  private var attachmentTimer: Timer?
+  private var attachmentObserver: AXObserver?
+  private var attachmentObserverSource: CFRunLoopSource?
   private var activeBundleIdentifier: String?
   private var activeAppHasVisibleWindow = false
   private var isRestoringFrame = false
+  private var isFollowingAttachedWindow = false
+  private var hasRequestedAccessibilityPermissionThisSession = false
+  private var attachedWindow: AttachedWindow?
+  private var currentContentDesignSize: NSSize?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     _ = notification
@@ -244,13 +259,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store: self.store,
         displayPreferences: self.displayPreferences,
         contentPreferences: self.contentPreferences,
-        credentialPreferences: self.credentialPreferences))
+        credentialPreferences: self.credentialPreferences,
+        attachmentState: self.attachmentState,
+        onToggleWindowAttachment: { [weak self] in
+          self?.toggleWindowAttachment()
+        }))
     panel.setFrameAutosaveName("QuotaFloatProportional557")
 
     if !panel.setFrameUsingName("QuotaFloatProportional557") {
       self.positionAtTopRight(panel)
     }
     self.enforceAllowedSize(panel)
+    self.currentContentDesignSize = self.contentPreferences.designSize
 
     self.panel = panel
     self.startApplicationVisibilityTracking()
@@ -264,6 +284,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
     }
     self.visibilityTimer?.invalidate()
+    self.saveAttachmentForActiveContext()
+    self.clearAttachmentRuntime(savePreference: false)
     self.displayModeObserver?.cancel()
     self.contentModeObserver?.cancel()
     self.store.stop()
@@ -271,11 +293,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   func windowShouldClose(_ sender: NSWindow) -> Bool {
     _ = sender
+    self.detachWindow(savePreference: true)
     self.contentPreferences.collapse()
     return false
   }
 
   func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+    if self.attachedWindow != nil {
+      return sender.frame.size
+    }
     let designSize = self.contentPreferences.designSize
     let minimumWidth = self.contentPreferences.minimumSize.width
     let maximumWidth = designSize.width * 10
@@ -292,7 +318,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   func windowDidMove(_ notification: Notification) {
     guard notification.object is NSPanel else { return }
-    self.saveFrameForActiveApp()
+    if self.attachedWindow == nil {
+      self.saveFrameForActiveApp()
+    } else if !self.isFollowingAttachedWindow {
+      self.refreshAttachmentOffset()
+    }
   }
 
   private func positionAtTopRight(_ panel: NSPanel) {
@@ -343,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         self.handleActivatedApplication(application)
         self.updateVisibilityPolling()
+        self.refreshAttachability()
         self.updatePanelVisibility()
       }
     }
@@ -359,6 +390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let self else { return }
         self.handleActivatedApplication(NSWorkspace.shared.frontmostApplication)
         self.updateVisibilityPolling()
+        self.refreshAttachability()
         self.updatePanelVisibility()
       }
     }
@@ -384,10 +416,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     self.updateVisibilityPolling()
+    self.refreshAttachability()
   }
 
   private func updatePanelVisibility() {
     guard let panel else { return }
+    if self.attachedWindow != nil, !self.attachedWindowIsVisible {
+      panel.orderOut(nil)
+      return
+    }
+
     let isSelectedApp =
       self.activeBundleIdentifier.map(self.displayPreferences.isEnabled) ?? false
     let shouldShow =
@@ -451,17 +489,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     if self.contentPreferences.isCollapsed {
+      self.detachWindow(savePreference: true)
       self.activeBundleIdentifier = bundleIdentifier
       self.activeAppHasVisibleWindow = false
       return
     }
 
     self.saveFrameForActiveApp()
+    self.saveAttachmentForActiveContext()
+    self.clearAttachmentRuntime(savePreference: false)
     self.activeBundleIdentifier = bundleIdentifier
     self.restoreContentSelectionForActiveContext()
     self.store.setActiveProviders(self.contentPreferences.activeProviders)
 
     self.restoreFrameForActiveContext()
+    self.refreshAttachability()
+    self.restoreAttachmentForActiveContext()
 
     if let bundleIdentifier {
       self.activeAppHasVisibleWindow =
@@ -525,7 +568,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   private func restoreFrame(contextKey: String) {
     guard let panel else { return }
     self.isRestoringFrame = true
-    defer { self.isRestoringFrame = false }
+    defer {
+      self.currentContentDesignSize = self.contentPreferences.designSize
+      self.isRestoringFrame = false
+    }
 
     if let frameString = UserDefaults.standard.string(
       forKey: Self.frameStorageKey(
@@ -552,12 +598,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   }
 
   private func contentConfigurationDidChange() {
+    if self.contentPreferences.isCollapsed {
+      self.detachWindow(savePreference: true)
+    }
     self.store.setActiveProviders(self.contentPreferences.activeProviders)
     guard !self.isRestoringFrame, let panel else { return }
 
     let designSize = self.contentPreferences.designSize
+    let previousDesignSize = self.currentContentDesignSize ?? designSize
     let oldFrame = panel.frame
-    let scale = max(1, oldFrame.height / designSize.height)
+    let minimumScale = self.contentPreferences.minimumSize.height / designSize.height
+    let scale = max(minimumScale, oldFrame.height / previousDesignSize.height)
     let newSize = NSSize(
       width: designSize.width * scale,
       height: designSize.height * scale)
@@ -568,12 +619,260 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     self.isRestoringFrame = true
     self.applyWindowConstraints(panel)
     panel.setFrame(NSRect(origin: newOrigin, size: newSize), display: true)
+    self.currentContentDesignSize = designSize
     self.isRestoringFrame = false
 
     self.saveContentSelectionForActiveContext()
     self.saveFrameForActiveApp()
     self.updateVisibilityPolling()
+    self.refreshAttachability()
     self.updatePanelVisibility()
+  }
+
+  private func toggleWindowAttachment() {
+    if self.attachedWindow != nil {
+      self.detachWindow(savePreference: true)
+    } else {
+      self.attachToFrontmostWindow(promptForAccessibility: true)
+    }
+  }
+
+  private func attachToFrontmostWindow(
+    placement preferredPlacement: AttachedWindowPlacement? = nil,
+    promptForAccessibility: Bool
+  ) {
+    guard
+      !self.contentPreferences.isCollapsed,
+      let panel,
+      let application = NSWorkspace.shared.frontmostApplication,
+      application.bundleIdentifier != Bundle.main.bundleIdentifier,
+      let targetWindow = Self.frontmostWindow(for: application)
+    else {
+      NSSound.beep()
+      self.refreshAttachability()
+      return
+    }
+
+    let placement = preferredPlacement ?? AttachedWindowPlacement(
+      panelFrame: panel.frame,
+      targetFrame: targetWindow.frame)
+    let accessibilityWindow = Self.accessibilityWindow(
+      for: application,
+      promptIfNeeded: self.shouldPromptForAccessibilityPermission(promptForAccessibility))
+    self.attachedWindow = AttachedWindow(
+      processIdentifier: application.processIdentifier,
+      windowNumber: targetWindow.windowNumber,
+      placement: placement,
+      accessibilityWindow: accessibilityWindow)
+    self.attachmentState.isAttached = true
+    self.saveAttachmentForActiveContext()
+    self.applyAttachmentConstraints()
+    if let accessibilityWindow {
+      self.startAccessibilityAttachmentObserver(
+        processIdentifier: application.processIdentifier,
+        window: accessibilityWindow)
+    } else {
+      self.startAttachmentPolling()
+    }
+    self.followAttachedWindow()
+  }
+
+  private func detachWindow(savePreference: Bool) {
+    guard self.attachedWindow != nil || self.attachmentState.isAttached else { return }
+    self.clearAttachmentRuntime(savePreference: savePreference)
+    self.updatePanelVisibility()
+  }
+
+  private func shouldPromptForAccessibilityPermission(_ requested: Bool) -> Bool {
+    guard requested, !AXIsProcessTrusted() else { return false }
+    let key = Self.accessibilityPromptedStorageKey()
+    guard
+      !self.hasRequestedAccessibilityPermissionThisSession,
+      !UserDefaults.standard.bool(forKey: key)
+    else {
+      return false
+    }
+    self.hasRequestedAccessibilityPermissionThisSession = true
+    UserDefaults.standard.set(true, forKey: key)
+    return true
+  }
+
+  private func clearAttachmentRuntime(savePreference: Bool) {
+    if savePreference {
+      self.saveAttachmentEnabledForActiveContext(false)
+    }
+    self.attachedWindow = nil
+    self.attachmentState.isAttached = false
+    self.attachmentTimer?.invalidate()
+    self.attachmentTimer = nil
+    if let observerSource = self.attachmentObserverSource {
+      CFRunLoopRemoveSource(CFRunLoopGetMain(), observerSource, .commonModes)
+    }
+    self.attachmentObserverSource = nil
+    self.attachmentObserver = nil
+    self.applyAttachmentConstraints()
+  }
+
+  private func applyAttachmentConstraints() {
+    guard let panel else { return }
+    let isAttached = self.attachedWindow != nil
+    panel.isMovableByWindowBackground = !isAttached
+    if isAttached {
+      panel.styleMask.remove(.resizable)
+    } else {
+      panel.styleMask.insert(.resizable)
+    }
+    self.applyWindowConstraints(panel)
+  }
+
+  private func startAttachmentPolling() {
+    guard self.attachmentTimer == nil else { return }
+    self.attachmentTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) {
+      [weak self] _ in
+      Task { @MainActor [weak self] in
+        self?.followAttachedWindow()
+      }
+    }
+  }
+
+  private func followAttachedWindow() {
+    guard
+      let panel,
+      let attachedWindow,
+      let targetFrame = self.targetFrame(for: attachedWindow)
+    else {
+      self.updatePanelVisibility()
+      return
+    }
+
+    let newOrigin = attachedWindow.placement.origin(
+      forPanelSize: panel.frame.size,
+      targetFrame: targetFrame)
+    guard
+      abs(panel.frame.origin.x - newOrigin.x) > 0.5
+        || abs(panel.frame.origin.y - newOrigin.y) > 0.5
+    else {
+      self.updatePanelVisibility()
+      return
+    }
+
+    self.isFollowingAttachedWindow = true
+    panel.setFrameOrigin(newOrigin)
+    self.isFollowingAttachedWindow = false
+    self.updatePanelVisibility()
+  }
+
+  private func refreshAttachmentOffset() {
+    guard
+      let panel,
+      var attachedWindow = self.attachedWindow,
+      let targetFrame = self.targetFrame(for: attachedWindow)
+    else {
+      return
+    }
+    attachedWindow.placement = AttachedWindowPlacement(
+      panelFrame: panel.frame,
+      targetFrame: targetFrame)
+    self.attachedWindow = attachedWindow
+    self.saveAttachmentForActiveContext()
+  }
+
+  private func refreshAttachability() {
+    guard
+      !self.contentPreferences.isCollapsed,
+      let application = NSWorkspace.shared.frontmostApplication,
+      application.bundleIdentifier != Bundle.main.bundleIdentifier
+    else {
+      self.attachmentState.canAttachToFrontmostWindow = false
+      return
+    }
+    self.attachmentState.canAttachToFrontmostWindow =
+      Self.frontmostWindow(for: application) != nil
+  }
+
+  private var attachedWindowIsVisible: Bool {
+    guard let attachedWindow else { return true }
+    return self.targetFrame(for: attachedWindow) != nil
+  }
+
+  private func targetFrame(for attachedWindow: AttachedWindow) -> NSRect? {
+    if let accessibilityWindow = attachedWindow.accessibilityWindow,
+      let frame = Self.accessibilityFrame(for: accessibilityWindow)
+    {
+      return frame
+    }
+    return Self.window(
+      processIdentifier: attachedWindow.processIdentifier,
+      windowNumber: attachedWindow.windowNumber)?.frame
+  }
+
+  private func startAccessibilityAttachmentObserver(
+    processIdentifier: pid_t,
+    window: AXUIElement
+  ) {
+    self.attachmentTimer?.invalidate()
+    self.attachmentTimer = nil
+    if let observerSource = self.attachmentObserverSource {
+      CFRunLoopRemoveSource(CFRunLoopGetMain(), observerSource, .commonModes)
+    }
+    self.attachmentObserverSource = nil
+    self.attachmentObserver = nil
+
+    var observer: AXObserver?
+    let error = AXObserverCreate(processIdentifier, quotaFloatAXObserverCallback, &observer)
+    guard error == .success, let observer else {
+      self.startAttachmentPolling()
+      return
+    }
+
+    let refcon = Unmanaged.passUnretained(self).toOpaque()
+    AXObserverAddNotification(observer, window, kAXMovedNotification as CFString, refcon)
+    AXObserverAddNotification(observer, window, kAXResizedNotification as CFString, refcon)
+    AXObserverAddNotification(observer, window, kAXUIElementDestroyedNotification as CFString, refcon)
+
+    let source = AXObserverGetRunLoopSource(observer)
+    CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+    self.attachmentObserver = observer
+    self.attachmentObserverSource = source
+  }
+
+  fileprivate func accessibilityObservedWindowDidChange() {
+    self.followAttachedWindow()
+  }
+
+  private func saveAttachmentForActiveContext() {
+    guard let contextKey = self.activeContextKey else { return }
+    let defaults = UserDefaults.standard
+    if let attachedWindow {
+      defaults.set(true, forKey: Self.attachmentEnabledStorageKey(contextKey: contextKey))
+      defaults.set(
+        attachedWindow.placement.storageString,
+        forKey: Self.attachmentPlacementStorageKey(contextKey: contextKey))
+    } else {
+      defaults.set(false, forKey: Self.attachmentEnabledStorageKey(contextKey: contextKey))
+    }
+  }
+
+  private func saveAttachmentEnabledForActiveContext(_ enabled: Bool) {
+    guard let contextKey = self.activeContextKey else { return }
+    UserDefaults.standard.set(
+      enabled,
+      forKey: Self.attachmentEnabledStorageKey(contextKey: contextKey))
+  }
+
+  private func restoreAttachmentForActiveContext() {
+    guard
+      !self.contentPreferences.isCollapsed,
+      let contextKey = self.activeContextKey,
+      UserDefaults.standard.bool(forKey: Self.attachmentEnabledStorageKey(contextKey: contextKey))
+    else {
+      return
+    }
+
+    let placement = UserDefaults.standard.string(
+      forKey: Self.attachmentPlacementStorageKey(contextKey: contextKey)
+    ).flatMap(AttachedWindowPlacement.init(storageString:))
+    self.attachToFrontmostWindow(placement: placement, promptForAccessibility: false)
   }
 
   private func restoreContentSelectionForActiveContext() {
@@ -666,5 +965,317 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
   private static func multiResetPinnedStorageKey(contextKey: String) -> String {
     "QuotaFloatMultiResetPinned.\(contextKey)"
+  }
+
+  private static func attachmentEnabledStorageKey(contextKey: String) -> String {
+    "QuotaFloatWindowAttachmentEnabled.\(contextKey)"
+  }
+
+  private static func attachmentPlacementStorageKey(contextKey: String) -> String {
+    "QuotaFloatWindowAttachmentPlacement.\(contextKey)"
+  }
+
+  private static func accessibilityPromptedStorageKey() -> String {
+    let executablePath = Bundle.main.executablePath ?? Bundle.main.bundlePath
+    return "QuotaFloatAccessibilityPrompted.\(executablePath)"
+  }
+}
+
+private struct AttachedWindow {
+  let processIdentifier: pid_t
+  let windowNumber: Int
+  var placement: AttachedWindowPlacement
+  let accessibilityWindow: AXUIElement?
+}
+
+private struct AttachedWindowPlacement {
+  enum HorizontalAnchor {
+    case left
+    case right
+  }
+
+  enum VerticalAnchor {
+    case bottom
+    case top
+  }
+
+  let horizontalAnchor: HorizontalAnchor
+  let verticalAnchor: VerticalAnchor
+  let horizontalInset: CGFloat
+  let verticalInset: CGFloat
+
+  var storageString: String {
+    [
+      self.horizontalAnchor.storageValue,
+      self.verticalAnchor.storageValue,
+      String(Double(self.horizontalInset)),
+      String(Double(self.verticalInset)),
+    ].joined(separator: ",")
+  }
+
+  init?(storageString: String) {
+    let parts = storageString.split(separator: ",").map(String.init)
+    guard
+      parts.count == 4,
+      let horizontalAnchor = HorizontalAnchor(storageValue: parts[0]),
+      let verticalAnchor = VerticalAnchor(storageValue: parts[1]),
+      let horizontalInset = Double(parts[2]),
+      let verticalInset = Double(parts[3])
+    else {
+      return nil
+    }
+    self.horizontalAnchor = horizontalAnchor
+    self.verticalAnchor = verticalAnchor
+    self.horizontalInset = CGFloat(horizontalInset)
+    self.verticalInset = CGFloat(verticalInset)
+  }
+
+  init(panelFrame: NSRect, targetFrame: NSRect) {
+    let leftInset = panelFrame.minX - targetFrame.minX
+    let rightInset = targetFrame.maxX - panelFrame.maxX
+    if abs(leftInset) <= abs(rightInset) {
+      self.horizontalAnchor = .left
+      self.horizontalInset = leftInset
+    } else {
+      self.horizontalAnchor = .right
+      self.horizontalInset = rightInset
+    }
+
+    let bottomInset = panelFrame.minY - targetFrame.minY
+    let topInset = targetFrame.maxY - panelFrame.maxY
+    if abs(bottomInset) <= abs(topInset) {
+      self.verticalAnchor = .bottom
+      self.verticalInset = bottomInset
+    } else {
+      self.verticalAnchor = .top
+      self.verticalInset = topInset
+    }
+  }
+
+  func origin(forPanelSize panelSize: NSSize, targetFrame: NSRect) -> NSPoint {
+    let x =
+      switch self.horizontalAnchor {
+      case .left:
+        targetFrame.minX + self.horizontalInset
+      case .right:
+        targetFrame.maxX - self.horizontalInset - panelSize.width
+      }
+    let y =
+      switch self.verticalAnchor {
+      case .bottom:
+        targetFrame.minY + self.verticalInset
+      case .top:
+        targetFrame.maxY - self.verticalInset - panelSize.height
+      }
+    return NSPoint(x: x, y: y)
+  }
+}
+
+extension AttachedWindowPlacement.HorizontalAnchor {
+  fileprivate var storageValue: String {
+    switch self {
+    case .left: "left"
+    case .right: "right"
+    }
+  }
+
+  fileprivate init?(storageValue: String) {
+    switch storageValue {
+    case "left": self = .left
+    case "right": self = .right
+    default: return nil
+    }
+  }
+}
+
+extension AttachedWindowPlacement.VerticalAnchor {
+  fileprivate var storageValue: String {
+    switch self {
+    case .bottom: "bottom"
+    case .top: "top"
+    }
+  }
+
+  fileprivate init?(storageValue: String) {
+    switch storageValue {
+    case "bottom": self = .bottom
+    case "top": self = .top
+    default: return nil
+    }
+  }
+}
+
+private struct TrackedWindow {
+  let windowNumber: Int
+  let frame: NSRect
+}
+
+extension AppDelegate {
+  private static func frontmostWindow(for application: NSRunningApplication) -> TrackedWindow? {
+    self.windows(processIdentifier: application.processIdentifier).first
+  }
+
+  private static func window(
+    processIdentifier: pid_t,
+    windowNumber: Int
+  ) -> TrackedWindow? {
+    self.windows(processIdentifier: processIdentifier).first {
+      $0.windowNumber == windowNumber
+    }
+  }
+
+  private static func windows(processIdentifier: pid_t) -> [TrackedWindow] {
+    guard
+      let windows = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements],
+        kCGNullWindowID) as? [[String: Any]]
+    else {
+      return []
+    }
+
+    return windows.compactMap { window in
+      guard
+        let ownerPID = window[kCGWindowOwnerPID as String] as? pid_t,
+        ownerPID == processIdentifier,
+        let layer = window[kCGWindowLayer as String] as? Int,
+        layer == 0,
+        let windowNumber = window[kCGWindowNumber as String] as? Int,
+        let boundsDictionary = window[kCGWindowBounds as String] as? NSDictionary,
+        let quartzFrame = CGRect(dictionaryRepresentation: boundsDictionary)
+      else {
+        return nil
+      }
+
+      let frame = self.convertQuartzWindowFrameToAppKit(quartzFrame)
+      guard frame.width >= 200, frame.height >= 100 else { return nil }
+      return TrackedWindow(windowNumber: windowNumber, frame: frame)
+    }
+  }
+
+  private static func convertQuartzWindowFrameToAppKit(_ quartzFrame: CGRect) -> NSRect {
+    let midpoint = CGPoint(x: quartzFrame.midX, y: quartzFrame.midY)
+    guard
+      let screen = NSScreen.screens.first(where: { screen in
+        guard
+          let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+            as? NSNumber
+        else {
+          return false
+        }
+        let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
+        return displayBounds.contains(midpoint)
+      }),
+      let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+        as? NSNumber
+    else {
+      return NSRect(origin: quartzFrame.origin, size: quartzFrame.size)
+    }
+
+    let displayBounds = CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value))
+    let localX = quartzFrame.minX - displayBounds.minX
+    let localYFromTop = quartzFrame.minY - displayBounds.minY
+    return NSRect(
+      x: screen.frame.minX + localX,
+      y: screen.frame.maxY - localYFromTop - quartzFrame.height,
+      width: quartzFrame.width,
+      height: quartzFrame.height)
+  }
+
+  private static func accessibilityWindow(
+    for application: NSRunningApplication,
+    promptIfNeeded: Bool
+  ) -> AXUIElement? {
+    let options =
+      promptIfNeeded
+      ? ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+      : nil
+    guard AXIsProcessTrustedWithOptions(options) else { return nil }
+
+    let appElement = AXUIElementCreateApplication(application.processIdentifier)
+    var focusedWindow: CFTypeRef?
+    if AXUIElementCopyAttributeValue(
+      appElement,
+      kAXFocusedWindowAttribute as CFString,
+      &focusedWindow) == .success,
+      let focusedWindow
+    {
+      return (focusedWindow as! AXUIElement)
+    }
+
+    var windows: CFTypeRef?
+    guard
+      AXUIElementCopyAttributeValue(
+        appElement,
+        kAXWindowsAttribute as CFString,
+        &windows) == .success,
+      let windowArray = windows as? [AXUIElement]
+    else {
+      return nil
+    }
+    return windowArray.first { self.accessibilityFrame(for: $0) != nil }
+  }
+
+  private static func accessibilityFrame(for window: AXUIElement) -> NSRect? {
+    guard
+      let position = self.accessibilityCGPoint(
+        for: window,
+        attribute: kAXPositionAttribute as CFString),
+      let size = self.accessibilityCGSize(
+        for: window,
+        attribute: kAXSizeAttribute as CFString)
+    else {
+      return nil
+    }
+    return self.convertQuartzWindowFrameToAppKit(CGRect(origin: position, size: size))
+  }
+
+  private static func accessibilityCGPoint(
+    for element: AXUIElement,
+    attribute: CFString
+  ) -> CGPoint? {
+    var value: CFTypeRef?
+    guard
+      AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+      let axValue = value,
+      CFGetTypeID(axValue) == AXValueGetTypeID()
+    else {
+      return nil
+    }
+    var point = CGPoint.zero
+    guard AXValueGetValue((axValue as! AXValue), .cgPoint, &point) else {
+      return nil
+    }
+    return point
+  }
+
+  private static func accessibilityCGSize(
+    for element: AXUIElement,
+    attribute: CFString
+  ) -> CGSize? {
+    var value: CFTypeRef?
+    guard
+      AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+      let axValue = value,
+      CFGetTypeID(axValue) == AXValueGetTypeID()
+    else {
+      return nil
+    }
+    var size = CGSize.zero
+    guard AXValueGetValue((axValue as! AXValue), .cgSize, &size) else {
+      return nil
+    }
+    return size
+  }
+}
+
+private let quotaFloatAXObserverCallback: AXObserverCallback = {
+  _,
+  _,
+  _,
+  refcon in
+  guard let refcon else { return }
+  let appDelegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+  Task { @MainActor in
+    appDelegate.accessibilityObservedWindowDidChange()
   }
 }
