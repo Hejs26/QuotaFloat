@@ -3,13 +3,14 @@
 <img src="Resources/AppIcon.png" alt="QuotaFloat App Icon" width="128">
 
 QuotaFloat 是一款原生 macOS 桌面悬浮额度工具，用于显示 Codex、Claude 和 Kimi Coding
-Plan 的 5 小时额度、周额度、重置倒计时与使用节奏。
+Plan，以及 Antigravity 中 Gemini、Claude / GPT 两组模型的 5 小时额度、周额度、重置倒计时与使用节奏。
 
 ## 当前支持
 
 - macOS 14 或更高版本
 - **仅支持 Apple Silicon（M1、M2、M3、M4 等 arm64 Mac）**
 - Codex、Claude 和 Kimi Coding Plan
+- Antigravity 的 Gemini 与 Claude / GPT 两组额度，可独立选择显示
 
 当前公开构建不支持 Intel Mac。
 
@@ -18,7 +19,7 @@ Plan 的 5 小时额度、周额度、重置倒计时与使用节奏。
 - `CodexBarCore` 直接编译进应用，无需另外安装 CodexBar。
 - 每 2 分钟只刷新当前选择显示的服务，也可以手动立即刷新。
 - 支持只显示一个服务或同时显示多个服务。
-- 支持始终显示，或仅在 Codex、Claude、Terminal / iTerm 中显示。
+- 支持始终显示，或仅在 Codex、Claude、Antigravity、Terminal / iTerm 中显示。
 - 网络失败时保留最后一次成功数据，并标记缓存或过期状态。
 - 无 Dock 运行图标，悬浮窗口置顶并记住不同应用中的位置和尺寸。
 
@@ -51,9 +52,9 @@ Plan 的 5 小时额度、周额度、重置倒计时与使用节奏。
 
 登录 Codex Desktop、Codex CLI 或 Codex IDE 扩展均可，不要求必须单独登录 CLI。
 
-QuotaFloat 当前读取 `CODEX_HOME/auth.json` 中的登录缓存；未设置 `CODEX_HOME` 时默认读取
-`~/.codex/auth.json`。只要 Codex Desktop 的登录信息保存在这个位置，QuotaFloat 就能直接获取
-官方额度。
+QuotaFloat 优先读取明确设置的 `CODEX_HOME/auth.json`。未设置 `CODEX_HOME` 时，会检查
+`~/.codex/auth.json` 与 `~/.codex-accounts/*/auth.json` 中的可用登录缓存，优先使用最近刷新的
+账号，避免从 Finder 启动时找不到登录信息。
 
 如果用户将 Codex 凭证配置为只保存在 macOS 钥匙串，而本机没有 `auth.json`，当前版本暂时无法
 读取，需要将 Codex 凭证存储方式设置为 `file`，或通过 Codex CLI 重新生成这份登录缓存。
@@ -77,10 +78,21 @@ Keychain API 读取方式；但 macOS 仍可能根据用户钥匙串状态和访
 
 文件权限为 `600`，仅当前用户可读。
 
+### Gemini / Claude / GPT
+
+打开并登录 Antigravity，在浮窗右键菜单中选择“Gemini”和“Claude / GPT”。两组使用相同的
+Antigravity 图标，各自显示 5 小时与周额度；名称后采用相同间距。它们与现有 Codex、Claude
+订阅额度独立，不会合并计算。
+
+两组共用一次额度读取。内置 CodexBarCore 优先读取运行中的 Antigravity 应用；不可用时尝试
+已安装的 `agy` CLI、Antigravity IDE，以及已有的 CodexBar Google OAuth 凭证。无需输入 Gemini
+API Key。较旧客户端可能只返回会话额度，未提供的周额度显示 `--`，不根据其他模型推算。
+重置时间只采用接口提供的时间戳；没有时间戳时不猜测倒计时。
+
 ## 隐私
 
 QuotaFloat 不包含遥测、广告或用户行为统计，也不会把凭证和额度数据上传给 QuotaFloat 作者。
-应用只连接当前所选模型服务对应的官方接口。
+应用只连接当前所选模型服务对应的官方接口，或 Antigravity 的本机服务。
 
 详细说明参见 [PRIVACY.md](PRIVACY.md)。
 
@@ -114,7 +126,14 @@ Developer ID 签名与 Apple Notarization。
 swift run QuotaFloat --self-test
 ```
 
-自检不会请求 Codex、Claude 或 Kimi。
+默认自检不会请求任何服务，包含两组额度映射、共享刷新、失败缓存与布局检查。
+
+可选：导出实际 SwiftUI 组件预览（示例数据），或读取本机已登录的 Antigravity 验证接入：
+
+```bash
+swift run QuotaFloat --self-test --preview-output /tmp/quotafloat-preview.png
+swift run QuotaFloat --self-test --live-antigravity
+```
 
 ## 开源许可
 

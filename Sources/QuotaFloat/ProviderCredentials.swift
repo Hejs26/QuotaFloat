@@ -1,6 +1,104 @@
 import AppKit
 import Foundation
 
+enum CodexHomeResolver {
+  static func resolvedEnvironment(
+    from environment: [String: String],
+    fileManager: FileManager = .default,
+    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+  ) -> [String: String] {
+    guard
+      (environment["CODEX_HOME"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+      let home = self.preferredHome(fileManager: fileManager, homeDirectory: homeDirectory)
+    else {
+      return environment
+    }
+
+    var resolved = environment
+    resolved["CODEX_HOME"] = home.path
+    return resolved
+  }
+
+  static func preferredHome(
+    fileManager: FileManager = .default,
+    homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+  ) -> URL? {
+    self.candidateHomes(fileManager: fileManager, homeDirectory: homeDirectory)
+      .compactMap { home -> Candidate? in
+        let authFile = home.appendingPathComponent("auth.json", isDirectory: false)
+        guard
+          fileManager.fileExists(atPath: authFile.path),
+          let data = try? Data(contentsOf: authFile),
+          let metadata = AuthMetadata(data: data)
+        else {
+          return nil
+        }
+        return Candidate(home: home, metadata: metadata)
+      }
+      .sorted { lhs, rhs in
+        if lhs.metadata.lastRefresh != rhs.metadata.lastRefresh {
+          return (lhs.metadata.lastRefresh ?? .distantPast)
+            > (rhs.metadata.lastRefresh ?? .distantPast)
+        }
+        return lhs.home.path < rhs.home.path
+      }
+      .first?
+      .home
+  }
+
+  private static func candidateHomes(
+    fileManager: FileManager,
+    homeDirectory: URL
+  ) -> [URL] {
+    var homes = [homeDirectory.appendingPathComponent(".codex", isDirectory: true)]
+    let accountsRoot = homeDirectory.appendingPathComponent(".codex-accounts", isDirectory: true)
+    if let accountHomes = try? fileManager.contentsOfDirectory(
+      at: accountsRoot,
+      includingPropertiesForKeys: [.isDirectoryKey],
+      options: [])
+    {
+      homes.append(contentsOf: accountHomes)
+    }
+    return homes
+  }
+
+  private struct Candidate {
+    let home: URL
+    let metadata: AuthMetadata
+  }
+
+  struct AuthMetadata {
+    let lastRefresh: Date?
+
+    init?(data: Data) {
+      guard
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let tokens = json["tokens"] as? [String: Any],
+        Self.nonEmptyString(tokens["access_token"]) != nil,
+        Self.nonEmptyString(tokens["refresh_token"]) != nil
+      else {
+        return nil
+      }
+      self.lastRefresh = Self.parseDate(json["last_refresh"])
+    }
+
+    private static func nonEmptyString(_ raw: Any?) -> String? {
+      guard let value = raw as? String else { return nil }
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func parseDate(_ raw: Any?) -> Date? {
+      guard let value = raw as? String, !value.isEmpty else { return nil }
+      let formatter = ISO8601DateFormatter()
+      formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+      if let date = formatter.date(from: value) { return date }
+      formatter.formatOptions = [.withInternetDateTime]
+      return formatter.date(from: value)
+    }
+  }
+}
+
 struct ClaudeOAuthEnvironmentCredentials: Equatable, Sendable {
   let accessToken: String
   let scopes: [String]

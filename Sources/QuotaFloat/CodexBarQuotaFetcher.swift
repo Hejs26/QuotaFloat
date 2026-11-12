@@ -2,7 +2,7 @@ import CodexBarCore
 import Foundation
 
 protocol QuotaFetching: Sendable {
-  func fetch(_ provider: QuotaProvider) async throws -> QuotaSnapshot
+  func fetch(_ provider: QuotaProvider) async throws -> [QuotaSnapshot]
 }
 
 enum QuotaFetchError: LocalizedError, Sendable {
@@ -59,7 +59,7 @@ struct CodexBarQuotaFetcher: QuotaFetching {
         manualCookieHeader: nil))
   }
 
-  func fetch(_ provider: QuotaProvider) async throws -> QuotaSnapshot {
+  func fetch(_ provider: QuotaProvider) async throws -> [QuotaSnapshot] {
     let environment = await self.environment(for: provider)
     if provider.definition.credential == .kimiCodingPlanAPIKey,
       ProviderTokenResolver.kimiAPIToken(environment: environment) == nil
@@ -86,21 +86,32 @@ struct CodexBarQuotaFetcher: QuotaFetching {
     let descriptor = ProviderDescriptorRegistry.descriptor(for: definition.coreProvider)
     let result = try await descriptor.fetch(context: context)
 
-    let windows = Self.mapWindows(result.usage, definition: definition)
-    guard windows.session != nil || windows.weekly != nil else {
+    let snapshots = provider.refreshGroup.map { member in
+      Self.mapSnapshot(result.usage, provider: member, source: result.sourceLabel)
+    }
+    guard snapshots.contains(where: \.hasQuotaData) else {
       throw QuotaFetchError.noQuotaWindows(provider)
     }
+    return snapshots
+  }
 
+  static func mapSnapshot(
+    _ usage: UsageSnapshot,
+    provider: QuotaProvider,
+    source: String
+  ) -> QuotaSnapshot {
+    let windows = Self.mapWindows(usage, definition: provider.definition)
+    let hasQuota = windows.session != nil || windows.weekly != nil
     return QuotaSnapshot(
       provider: provider,
       session: windows.session,
       weekly: windows.weekly,
-      resetCredits: Self.mapResetCredits(result.usage.codexResetCredits),
-      accountEmail: result.usage.accountEmail(for: definition.coreProvider),
-      source: result.sourceLabel,
-      updatedAt: result.usage.updatedAt,
-      freshness: .fresh,
-      message: nil)
+      resetCredits: Self.mapResetCredits(usage.codexResetCredits),
+      accountEmail: usage.accountEmail(for: provider.definition.coreProvider),
+      source: source,
+      updatedAt: usage.updatedAt,
+      freshness: hasQuota ? .fresh : .unavailable,
+      message: hasQuota ? nil : QuotaFetchError.noQuotaWindows(provider).localizedDescription)
   }
 
   static func mapWindows(
@@ -109,6 +120,9 @@ struct CodexBarQuotaFetcher: QuotaFetching {
   ) -> (
     session: QuotaWindow?, weekly: QuotaWindow?
   ) {
+    if definition.id.isAntigravity {
+      return Self.mapAntigravityWindows(usage, provider: definition.id)
+    }
     let candidates = [usage.primary, usage.secondary, usage.tertiary].compactMap { $0 }
 
     let sessionSource: (window: RateWindow, assumedMinutes: Int?)? =
@@ -137,8 +151,37 @@ struct CodexBarQuotaFetcher: QuotaFetching {
     )
   }
 
+  private static func mapAntigravityWindows(
+    _ usage: UsageSnapshot,
+    provider: QuotaProvider
+  ) -> (session: QuotaWindow?, weekly: QuotaWindow?) {
+    let summary = (usage.extraRateWindows ?? []).filter {
+      $0.id.hasPrefix("antigravity-quota-summary-")
+    }
+    if !summary.isEmpty {
+      let windows = summary.filter { named in
+        let title = named.title.lowercased()
+        let matchesGroup = provider == .antigravityGemini
+          ? title.contains("gemini") : (title.contains("claude") || title.contains("gpt"))
+        return matchesGroup && named.usageKnown && named.window.usedPercent.isFinite
+      }.map(\.window)
+      return (
+        windows.first { $0.windowMinutes == 300 }.map { Self.mapWindow($0, assumedMinutes: nil) },
+        windows.first { $0.windowMinutes == 10_080 }.map { Self.mapWindow($0, assumedMinutes: nil) }
+      )
+    }
+
+    // Older app/IDE responses provide one session pool per model group, never a weekly pool.
+    let session = provider == .antigravityGemini ? usage.primary : usage.secondary
+    guard let session, session.usedPercent.isFinite else { return (nil, nil) }
+    return (Self.mapWindow(session, assumedMinutes: nil), nil)
+  }
+
   private func environment(for provider: QuotaProvider) async -> [String: String] {
     var environment = self.baseEnvironment
+    if provider == .codex {
+      environment = CodexHomeResolver.resolvedEnvironment(from: environment)
+    }
     if provider == .claude,
       let credentials = await self.claudeOAuthLoader.load()
     {
@@ -156,8 +199,9 @@ struct CodexBarQuotaFetcher: QuotaFetching {
 
   private static func fallbackWindow(
     usage: UsageSnapshot,
-    fallback: QuotaWindowFallback
+    fallback: QuotaWindowFallback?
   ) -> (window: RateWindow, assumedMinutes: Int?)? {
+    guard let fallback else { return nil }
     let window: RateWindow? = switch fallback.lane {
     case .primary: usage.primary
     case .secondary: usage.secondary

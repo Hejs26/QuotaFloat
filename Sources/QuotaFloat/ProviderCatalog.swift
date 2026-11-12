@@ -5,6 +5,7 @@ enum QuotaProviderIcon: Sendable {
   case codex
   case claude
   case kimi
+  case antigravity
 }
 
 enum QuotaProviderCredential: Equatable, Sendable {
@@ -36,8 +37,8 @@ struct QuotaProviderDefinition: Sendable {
   let icon: QuotaProviderIcon
   let color: QuotaProviderColor
   let credential: QuotaProviderCredential
-  let sessionFallback: QuotaWindowFallback
-  let weeklyFallback: QuotaWindowFallback
+  let sessionFallback: QuotaWindowFallback?
+  let weeklyFallback: QuotaWindowFallback?
 }
 
 enum QuotaProviderCatalog {
@@ -69,6 +70,24 @@ enum QuotaProviderCatalog {
       credential: .kimiCodingPlanAPIKey,
       sessionFallback: QuotaWindowFallback(lane: .secondary, assumedMinutes: 300),
       weeklyFallback: QuotaWindowFallback(lane: .primary, assumedMinutes: 10_080)),
+    QuotaProviderDefinition(
+      id: .antigravityGemini,
+      displayName: "Gemini",
+      coreProvider: .antigravity,
+      icon: .antigravity,
+      color: QuotaProviderColor(red: 0.20, green: 0.43, blue: 0.98),
+      credential: .none,
+      sessionFallback: nil,
+      weeklyFallback: nil),
+    QuotaProviderDefinition(
+      id: .antigravityClaudeGPT,
+      displayName: "Claude / GPT",
+      coreProvider: .antigravity,
+      icon: .antigravity,
+      color: QuotaProviderColor(red: 0.20, green: 0.43, blue: 0.98),
+      credential: .none,
+      sessionFallback: nil,
+      weeklyFallback: nil),
   ]
 
   private static let byID = Dictionary(uniqueKeysWithValues: Self.definitions.map { ($0.id, $0) })
@@ -86,6 +105,18 @@ enum QuotaProviderCatalog {
 }
 
 extension QuotaProvider {
+  var isAntigravity: Bool {
+    self.definition.coreProvider == .antigravity
+  }
+
+  var refreshProvider: QuotaProvider {
+    self.isAntigravity ? .antigravityGemini : self
+  }
+
+  var refreshGroup: [QuotaProvider] {
+    QuotaProviderCatalog.orderedProviders.filter { $0.refreshProvider == self.refreshProvider }
+  }
+
   var definition: QuotaProviderDefinition {
     QuotaProviderCatalog.definition(for: self)
   }

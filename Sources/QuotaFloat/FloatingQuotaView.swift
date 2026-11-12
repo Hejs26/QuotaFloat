@@ -6,6 +6,68 @@ enum PanelMargins {
   static let left: CGFloat = right + 8
 }
 
+@MainActor
+enum ProviderStripLayout {
+  static let spacing: CGFloat = 9
+  static let nameFont = NSFont.systemFont(ofSize: 12, weight: .medium)
+
+  static func nameWidth(for provider: QuotaProvider) -> CGFloat {
+    guard provider.isAntigravity else { return 0 }
+    return ceil((provider.displayName as NSString).size(withAttributes: [.font: self.nameFont]).width)
+  }
+
+  static func width(for provider: QuotaProvider) -> CGFloat {
+    224 + (provider.isAntigravity ? self.nameWidth(for: provider) + self.spacing : 0)
+  }
+}
+
+extension FloatingQuotaView {
+  @MainActor
+  static func renderPreview(snapshots: [QuotaSnapshot], to url: URL) throws {
+    let content = VStack(alignment: .leading, spacing: 18) {
+      Text("精简模式 · 示例数据")
+        .font(.system(size: 13, weight: .medium))
+      HStack(spacing: 14) {
+        ForEach(Array(snapshots.enumerated()), id: \.element.id) { index, snapshot in
+          if index > 0 {
+            Rectangle().fill(Color.black.opacity(0.08)).frame(width: 1, height: 21)
+          }
+          ProviderStrip(provider: snapshot.provider, snapshot: snapshot, showsResetOnHover: false, onPinReset: nil)
+        }
+      }
+      .padding(.horizontal, 18)
+      .frame(height: 40)
+      .background(Color.black.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+
+      Text("常驻倒计时 · 示例数据")
+        .font(.system(size: 13, weight: .medium))
+      HStack(spacing: 14) {
+        ForEach(Array(snapshots.filter { $0.provider.isAntigravity }.enumerated()), id: \.element.id) { index, snapshot in
+          if index > 0 {
+            Rectangle().fill(Color.black.opacity(0.08)).frame(width: 1, height: 21)
+          }
+          ProviderStrip(provider: snapshot.provider, snapshot: snapshot, showsResetOnHover: false, onPinReset: nil)
+          ResetHoverSummary(session: snapshot.session, weekly: snapshot.weekly, width: 110)
+        }
+      }
+      .padding(.horizontal, 18)
+      .frame(height: 40)
+      .background(Color.black.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+    }
+    .padding(24)
+    .background(Color.white)
+    .environment(\.colorScheme, .light)
+    let renderer = ImageRenderer(content: content)
+    renderer.scale = 2
+    guard let image = renderer.cgImage,
+      let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+    else {
+      throw CocoaError(.fileWriteUnknown)
+    }
+    try png.write(to: url)
+  }
+}
+
 struct FloatingQuotaView: View {
   @ObservedObject var store: QuotaStore
   @ObservedObject var displayPreferences: DisplayPreferences
@@ -128,6 +190,15 @@ struct FloatingQuotaView: View {
         Label(
           "仅在 Claude 中显示",
           systemImage: self.displayPreferences.isEnabled("com.anthropic.claudefordesktop")
+            ? "checkmark" : "")
+      }
+
+      Button {
+        self.displayPreferences.toggleApp(DisplayPreferences.antigravityBundleIdentifier)
+      } label: {
+        Label(
+          "仅在 Antigravity 中显示",
+          systemImage: self.displayPreferences.isEnabled(DisplayPreferences.antigravityBundleIdentifier)
             ? "checkmark" : "")
       }
 
@@ -383,13 +454,21 @@ private struct ProviderStrip: View {
   @State private var isHoveringIcon = false
 
   var body: some View {
-    HStack(spacing: 9) {
+    HStack(spacing: ProviderStripLayout.spacing) {
       ProviderMark(
         provider: self.provider,
         resetCredits: self.snapshot?.resetCredits,
         onHover: { hovering in
           self.isHoveringIcon = hovering
         })
+
+      if self.provider.isAntigravity {
+        Text(self.provider.displayName)
+          .font(Font(ProviderStripLayout.nameFont))
+          .foregroundStyle(Color(red: 0.27, green: 0.26, blue: 0.24))
+          .fixedSize()
+          .frame(width: ProviderStripLayout.nameWidth(for: self.provider), alignment: .leading)
+      }
 
       Group {
         if self.isHoveringIcon,
@@ -421,7 +500,7 @@ private struct ProviderStrip: View {
       .contentShape(Rectangle())
       .onHover { self.isHoveringMetrics = $0 }
     }
-    .frame(width: 224)
+    .frame(width: ProviderStripLayout.width(for: self.provider))
     .opacity(self.contentOpacity)
     .animation(.easeOut(duration: 0.12), value: self.isHoveringMetrics)
     .animation(.easeOut(duration: 0.12), value: self.isHoveringIcon)
@@ -750,6 +829,8 @@ private struct ProviderMark: View {
           ClaudeMark()
         case .kimi:
           KimiMark()
+        case .antigravity:
+          AntigravityMark()
         }
       }
       .frame(width: 24, height: 24)
@@ -890,6 +971,33 @@ private struct KimiMark: View {
       return NSImage(size: NSSize(width: 24, height: 24))
     }
     image.isTemplate = true
+    return image
+  }()
+}
+
+private struct AntigravityMark: View {
+  var body: some View {
+    RoundedRectangle(cornerRadius: 6, style: .continuous)
+      .fill(Color.white)
+      .overlay {
+        Image(nsImage: Self.image)
+          .resizable()
+          .aspectRatio(contentMode: .fit)
+          .padding(3)
+      }
+      .overlay {
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+          .stroke(Color.black.opacity(0.06), lineWidth: 1)
+      }
+      .shadow(color: Color.black.opacity(0.04), radius: 1, y: 1)
+  }
+
+  private static let image: NSImage = {
+    guard let url = Bundle.module.url(forResource: "antigravity-mark", withExtension: "png"),
+      let image = NSImage(contentsOf: url)
+    else {
+      return NSImage(size: NSSize(width: 24, height: 24))
+    }
     return image
   }()
 }

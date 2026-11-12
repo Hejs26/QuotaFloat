@@ -23,6 +23,7 @@ let package = Package(
       path: "Sources/QuotaFloat",
       resources: [
         .copy("Resources/claude-mark.svg"),
-        .copy("Resources/kimi-mark.svg")
+        .copy("Resources/kimi-mark.svg"),
+        .copy("Resources/antigravity-mark.png")
       ])
   ])

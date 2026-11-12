@@ -13,20 +13,21 @@ final class DisplayPreferences: ObservableObject {
   private static let legacyStorageKey = "QuotaFloatDisplayMode"
   private static let alwaysStorageKey = "QuotaFloatAlwaysDisplay"
   private static let selectedAppsStorageKey = "QuotaFloatSelectedApps"
+  private let defaults: UserDefaults
 
   @Published private(set) var alwaysDisplay: Bool
   @Published private(set) var selectedApps: Set<String>
+  static let antigravityBundleIdentifier = "com.google.antigravity"
   static let terminalBundleIdentifiers: Set<String> = [
     "com.googlecode.iterm2",
     "com.apple.Terminal",
   ]
 
-  init() {
-    let defaults = UserDefaults.standard
+  init(defaults: UserDefaults = .standard) {
+    self.defaults = defaults
     if defaults.integer(forKey: Self.configurationVersionKey) < Self.configurationVersion {
       self.alwaysDisplay = true
       self.selectedApps = []
-      self.save()
     } else if defaults.object(forKey: Self.alwaysStorageKey) != nil {
       self.alwaysDisplay = defaults.bool(forKey: Self.alwaysStorageKey)
       self.selectedApps = Set(
@@ -39,8 +40,8 @@ final class DisplayPreferences: ObservableObject {
         shouldAlwaysDisplay
         ? []
         : ["com.openai.codex", "com.anthropic.claudefordesktop"]
-      self.save()
     }
+    self.save()
   }
 
   func isEnabled(_ bundleIdentifier: String) -> Bool {
@@ -78,7 +79,10 @@ final class DisplayPreferences: ObservableObject {
   }
 
   private func save() {
-    let defaults = UserDefaults.standard
+    if self.selectedApps.isEmpty {
+      self.alwaysDisplay = true
+    }
+    let defaults = self.defaults
     defaults.set(Self.configurationVersion, forKey: Self.configurationVersionKey)
     defaults.set(self.alwaysDisplay, forKey: Self.alwaysStorageKey)
     defaults.set(Array(self.selectedApps).sorted(), forKey: Self.selectedAppsStorageKey)
@@ -92,7 +96,6 @@ final class ContentPreferences: ObservableObject {
   @Published private(set) var multiResetPinned = false
   @Published private(set) var isCollapsed = false
 
-  private static let providerStripWidth: CGFloat = 224
   private static let providerSeparatorWidth: CGFloat = 29
   private static let pinnedResetWidth: CGFloat = 110
   private static let collapsedWidth: CGFloat = 126
@@ -103,16 +106,11 @@ final class ContentPreferences: ObservableObject {
     }
 
     let providerCount = max(1, self.selectedProviders.count)
-    let providerWidth = Self.providerStripWidth
-      + ((providerCount == 1 ? self.singleResetPinned : self.multiResetPinned)
-        ? 14 + Self.pinnedResetWidth
-        : 0)
-    let contentWidth: CGFloat = if providerCount == 1 {
-      providerWidth
-    } else {
-      CGFloat(providerCount) * providerWidth
-        + CGFloat(providerCount - 1) * Self.providerSeparatorWidth
-    }
+    let resetWidth = (providerCount == 1 ? self.singleResetPinned : self.multiResetPinned)
+      ? 14 + Self.pinnedResetWidth : 0
+    let contentWidth = self.orderedSelectedProviders.reduce(CGFloat.zero) {
+      $0 + ProviderStripLayout.width(for: $1) + resetWidth
+    } + CGFloat(providerCount - 1) * Self.providerSeparatorWidth
     return NSSize(
       width: contentWidth + PanelMargins.left + PanelMargins.right,
       height: 40)
@@ -187,6 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   private static let supportedBundleIdentifiers = [
     "com.openai.codex",
     "com.anthropic.claudefordesktop",
+    DisplayPreferences.antigravityBundleIdentifier,
     "com.googlecode.iterm2",
     "com.apple.Terminal",
   ]
@@ -220,14 +219,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
       reason: "QuotaFloat uses file-based credentials and CLI fallback")
 
     if CommandLine.arguments.contains("--self-test") {
-      do {
-        try QuotaFloatSelfTest.run()
-        print("QuotaFloat self-test passed.")
-        exit(EXIT_SUCCESS)
-      } catch {
-        FileHandle.standardError.write(Data("QuotaFloat self-test failed: \(error)\n".utf8))
-        exit(EXIT_FAILURE)
+      Task {
+        do {
+          try await QuotaFloatSelfTest.run()
+          print("QuotaFloat self-test passed.")
+          exit(EXIT_SUCCESS)
+        } catch {
+          FileHandle.standardError.write(Data("QuotaFloat self-test failed: \(error)\n".utf8))
+          exit(EXIT_FAILURE)
+        }
       }
+      return
     }
 
     NSApplication.shared.setActivationPolicy(.accessory)
@@ -276,6 +278,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     self.startApplicationVisibilityTracking()
     self.updatePanelVisibility()
     self.store.start()
+  }
+
+  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+    guard let panel else { return false }
+    self.detachWindow(savePreference: false)
+    self.displayPreferences.selectAlwaysDisplay()
+    if self.contentPreferences.isCollapsed {
+      self.contentPreferences.expandAll()
+    }
+    if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(panel.frame) }) {
+      self.positionAtTopRight(panel)
+    }
+    self.updatePanelVisibility()
+    return true
   }
 
   func applicationWillTerminate(_ notification: Notification) {

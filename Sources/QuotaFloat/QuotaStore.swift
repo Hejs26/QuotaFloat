@@ -2,7 +2,7 @@ import Foundation
 
 private struct QuotaRefreshOutcome: Sendable {
   let provider: QuotaProvider
-  let snapshot: QuotaSnapshot?
+  let snapshots: [QuotaSnapshot]
   let errorDescription: String?
   let wasCancelled: Bool
 }
@@ -37,6 +37,10 @@ final class QuotaStore: ObservableObject {
   private var inFlightTokens: [QuotaProvider: UUID] = [:]
   private var timerTask: Task<Void, Never>?
   private var hasStarted = false
+
+  private var activeRefreshProviders: Set<QuotaProvider> {
+    Set(self.activeProviders.map(\.refreshProvider))
+  }
 
   init(
     fetcher: any QuotaFetching = CodexBarQuotaFetcher(),
@@ -97,7 +101,8 @@ final class QuotaStore: ObservableObject {
     guard self.hasStarted else { return }
 
     let now = Date()
-    for provider in providers where self.activeProviders.contains(provider) {
+    let refreshProviders = Set(providers.map(\.refreshProvider))
+    for provider in refreshProviders where self.activeRefreshProviders.contains(provider) {
       guard self.inFlightTasks[provider] == nil else { continue }
       guard force || QuotaRefreshPolicy.isDue(
         lastAttemptAt: self.lastAttemptByProvider[provider],
@@ -123,22 +128,22 @@ final class QuotaStore: ObservableObject {
     self.inFlightTasks[provider] = Task { [weak self] in
       let outcome: QuotaRefreshOutcome
       do {
-        let snapshot = try await fetcher.fetch(provider)
+        let snapshots = try await fetcher.fetch(provider)
         outcome = QuotaRefreshOutcome(
           provider: provider,
-          snapshot: snapshot,
+          snapshots: snapshots,
           errorDescription: nil,
           wasCancelled: false)
       } catch is CancellationError {
         outcome = QuotaRefreshOutcome(
           provider: provider,
-          snapshot: nil,
+          snapshots: [],
           errorDescription: nil,
           wasCancelled: true)
       } catch {
         outcome = QuotaRefreshOutcome(
           provider: provider,
-          snapshot: nil,
+          snapshots: [],
           errorDescription: error.localizedDescription,
           wasCancelled: false)
       }
@@ -156,10 +161,17 @@ final class QuotaStore: ObservableObject {
 
     if !outcome.wasCancelled {
       let now = Date()
-      if let snapshot = outcome.snapshot {
-        self.snapshots[outcome.provider] = snapshot
-      } else if let message = outcome.errorDescription {
-        self.applyFailure(provider: outcome.provider, message: message, now: now)
+      for provider in outcome.provider.refreshGroup {
+        if let snapshot = outcome.snapshots.first(where: { $0.provider == provider }),
+          snapshot.hasQuotaData
+        {
+          self.snapshots[provider] = snapshot
+        } else {
+          let message = outcome.errorDescription
+            ?? outcome.snapshots.first(where: { $0.provider == provider })?.message
+            ?? QuotaFetchError.noQuotaWindows(provider).localizedDescription
+          self.applyFailure(provider: provider, message: message, now: now)
+        }
       }
       self.cacheStore.save(Array(self.snapshots.values))
     }
@@ -175,7 +187,7 @@ final class QuotaStore: ObservableObject {
     guard self.hasStarted else { return }
 
     let now = Date()
-    let nextDate = self.activeProviders.compactMap { provider -> Date? in
+    let nextDate = self.activeRefreshProviders.compactMap { provider -> Date? in
       guard self.inFlightTasks[provider] == nil else { return nil }
       guard let lastAttempt = self.lastAttemptByProvider[provider] else { return now }
       return lastAttempt.addingTimeInterval(self.refreshInterval)
@@ -225,7 +237,10 @@ final class QuotaStore: ObservableObject {
   }
 
   private static func userFacingMessage(provider: QuotaProvider, message: String) -> String {
-    switch Self.failureState(message) {
+    if provider.isAntigravity {
+      return "请打开并登录 Antigravity 后重试。\n\(message)"
+    }
+    return switch Self.failureState(message) {
     case .authRequired:
       provider.definition.credential == .kimiCodingPlanAPIKey
         ? "请右键设置 Kimi Coding Plan API Key"

@@ -4,6 +4,8 @@ enum QuotaProvider: String, Codable, CaseIterable, Identifiable, Sendable {
   case codex
   case claude
   case kimi
+  case antigravityGemini
+  case antigravityClaudeGPT
 
   var id: String { self.rawValue }
 
